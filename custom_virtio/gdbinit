@@ -1,0 +1,3 @@
+add-auto-load-safe-path /home/max/Documents/Crazy/small_stuff/custom_virtio/linux/
+source /home/max/Documents/Crazy/small_stuff/custom_virtio/linux/vmlinux-gdb.py
+target remote :1234

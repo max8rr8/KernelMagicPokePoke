@@ -1,0 +1,4 @@
+set debuginfod enabled off
+set print thread-events off
+handle SIGUSR1 nostop noprint
+run

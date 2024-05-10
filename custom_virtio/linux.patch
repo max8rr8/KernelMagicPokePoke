@@ -1,0 +1,314 @@
+diff --git a/drivers/virtio/Kconfig b/drivers/virtio/Kconfig
+index 0a53a6123..1287aa62c 100644
+--- a/drivers/virtio/Kconfig
++++ b/drivers/virtio/Kconfig
+@@ -173,4 +173,10 @@ config VIRTIO_DMA_SHARED_BUFFER
+ 	 This option adds a flavor of dma buffers that are backed by
+ 	 virtio resources.
+ 
++config VIRTIO_RPC
++	tristate "Virtio RPC"
++	depends on VIRTIO
++	help
++	  Magic virtio device that maybe an rpc something
++
+ endif # VIRTIO_MENU
+diff --git a/drivers/virtio/Makefile b/drivers/virtio/Makefile
+index 8e98d2491..0b73f03f6 100644
+--- a/drivers/virtio/Makefile
++++ b/drivers/virtio/Makefile
+@@ -12,3 +12,4 @@ obj-$(CONFIG_VIRTIO_INPUT) += virtio_input.o
+ obj-$(CONFIG_VIRTIO_VDPA) += virtio_vdpa.o
+ obj-$(CONFIG_VIRTIO_MEM) += virtio_mem.o
+ obj-$(CONFIG_VIRTIO_DMA_SHARED_BUFFER) += virtio_dma_buf.o
++obj-$(CONFIG_VIRTIO_RPC) += virtio_rpc.o
+diff --git a/drivers/virtio/virtio_rpc.c b/drivers/virtio/virtio_rpc.c
+new file mode 100644
+index 000000000..2ffca7166
+--- /dev/null
++++ b/drivers/virtio/virtio_rpc.c
+@@ -0,0 +1,250 @@
++#include "asm-generic/errno-base.h"
++#include "linux/completion.h"
++#include "linux/err.h"
++#include "linux/gfp_types.h"
++#include "linux/scatterlist.h"
++#include "linux/string.h"
++#include "linux/uaccess.h"
++#include "linux/virtio.h"
++#include "linux/virtio_ids.h"
++#include "linux/virtio_config.h"
++#include "linux/module.h"
++#include <uapi/linux/virtio_rpc.h>
++#include <linux/idr.h>
++#include <linux/cdev.h>
++
++struct virtio_rpc_ioctl_req {
++	void *inbuf;
++	size_t insize;
++
++	void *outbuf;
++	size_t outsize;
++};
++
++static DEFINE_IDA(virtio_rpc_ida);
++static int virtio_rpc_major;
++
++static const struct class virtio_rpc_class = {
++	.name = "virtio_rpc",
++};
++
++/* device private data (one per device) */
++struct virtio_rpc_dev {
++	struct virtqueue *vq;
++	int id;
++	struct cdev cdev;
++	uint64_t magic;
++};
++
++static int virtio_rpc_open(struct inode *inode, struct file *file)
++{
++	struct virtio_rpc_dev *dev =
++		container_of(inode->i_cdev, struct virtio_rpc_dev, cdev);
++
++	printk(KERN_INFO "virtio-rpc: opened chardev\n");
++
++	file->private_data = dev;
++	return 0;
++}
++
++static int virtio_rpc_release(struct inode *inode, struct file *file)
++{
++	printk(KERN_INFO "virtio-rpc: closed chardev\n");
++
++	return 0;
++}
++
++static long virtio_rpc_ioctl(struct file *file, unsigned int cmd,
++			     unsigned long arg)
++{
++	struct completion compl ;
++	struct virtio_rpc_ioctl_req req;
++	struct virtio_rpc_dev *dev =
++		(struct virtio_rpc_dev *)file->private_data;
++	int ret = 0;
++
++	printk(KERN_INFO "virtio-rpc: ioctl called %d\n", cmd);
++
++	init_completion(&compl );
++
++	if (copy_from_user(&req, (void *)arg,
++			   sizeof(struct virtio_rpc_ioctl_req))) {
++		return -EINVAL;
++	}
++
++	char *in_BUFFER = kmemdup(req.inbuf, req.insize, GFP_KERNEL);
++	if (!in_BUFFER) {
++		return -EINVAL;
++	}
++
++	char *out_BUFFER = kzalloc(req.outsize, GFP_KERNEL);
++	if (!out_BUFFER) {
++		ret = -ENOMEM;
++		goto fail_out;
++	}
++
++	struct scatterlist out_sg[1];
++	struct scatterlist in_sg[1];
++
++	sg_init_one(out_sg, in_BUFFER, req.insize);
++	sg_init_one(in_sg, out_BUFFER, req.outsize);
++
++	struct scatterlist *sgs[2] = { out_sg, in_sg };
++
++	printk(KERN_INFO "virtio-rpc: buffer submitted\n");
++	virtqueue_add_sgs(dev->vq, sgs, 1, 1, &compl, GFP_ATOMIC);
++	virtqueue_kick(dev->vq);
++	wait_for_completion(&compl );
++	printk(KERN_INFO "virtio-rpc: buffer finished\n");
++
++	if (copy_to_user(req.outbuf, out_BUFFER, req.outsize)) {
++		ret = -EINVAL;
++	}
++
++	kfree(out_BUFFER);
++fail_out:
++	kfree(in_BUFFER);
++	return ret;
++}
++
++static const struct file_operations virtio_rpc_fops = {
++	.open = virtio_rpc_open,
++	.release = virtio_rpc_release,
++	.unlocked_ioctl = virtio_rpc_ioctl,
++	.llseek = no_llseek,
++};
++
++static void virtio_rpc_recv_cb(struct virtqueue *vq)
++{
++	struct virtio_rpc_dev *dev = vq->vdev->priv;
++	void *buf;
++	unsigned int len;
++
++	while ((buf = virtqueue_get_buf(dev->vq, &len)) != NULL) {
++		/* process the received data */
++		complete(buf);
++	}
++}
++
++static int virtio_rpc_probe(struct virtio_device *vdev)
++{
++	struct virtio_rpc_dev *dev = NULL;
++
++	printk(KERN_INFO "virtio-rpc: probing for rpc\n");
++
++	/* initialize device data */
++	dev = kzalloc(sizeof(struct virtio_rpc_dev), GFP_KERNEL);
++	if (!dev)
++		return -ENOMEM;
++
++	virtio_cread_le(vdev, struct virtio_rpc_config, magic, &dev->magic);
++	printk(KERN_INFO "virtio-rpc: magic is %llx\n", dev->magic);
++
++	dev->id = ida_alloc(&virtio_rpc_ida, GFP_KERNEL);
++
++	/* the device has a single virtqueue */
++	dev->vq = virtio_find_single_vq(vdev, virtio_rpc_recv_cb, "input");
++	printk(KERN_INFO "virtio-rpc: queue found %px\n", dev->vq);
++	if (IS_ERR(dev->vq)) {
++		dev_err(&vdev->dev, "failed to find virtqueue\n");
++
++		kfree(dev);
++		return PTR_ERR(dev->vq);
++	}
++	vdev->priv = dev;
++
++	cdev_init(&dev->cdev, &virtio_rpc_fops);
++	dev->cdev.owner = THIS_MODULE;
++
++	struct device *devcreateres = device_create(
++		&virtio_rpc_class, &vdev->dev, MKDEV(virtio_rpc_major, dev->id),
++		NULL, "virtio_rpc%u", dev->id);
++	if (IS_ERR(devcreateres)) {
++		dev_err(&vdev->dev, "can't create device\n");
++		return PTR_ERR(devcreateres);
++	}
++
++	int retval = cdev_add(&dev->cdev, MKDEV(virtio_rpc_major, dev->id), 1);
++	if (retval) {
++		dev_err(&vdev->dev, "chardev registration failed\n");
++
++		kfree(dev);
++		return PTR_ERR(dev->vq);
++	}
++
++	/* from this point on, the device can notify and get callbacks */
++	virtio_device_ready(vdev);
++
++	printk(KERN_INFO "virtio-rpc: ready!!!\n");
++	return 0;
++}
++
++static void virtio_rpc_remove(struct virtio_device *vdev)
++{
++	struct virtio_rpc_dev *dev = vdev->priv;
++	char *buf;
++	/*
++   * disable vq interrupts: equivalent to
++   * vdev->config->reset(vdev)
++   */
++	virtio_reset_device(vdev);
++
++	/* detach unused buffers */
++	while ((buf = virtqueue_detach_unused_buf(dev->vq)) != NULL) {
++		kfree(buf);
++	}
++
++	/* remove virtqueues */
++	vdev->config->del_vqs(vdev);
++
++	kfree(dev);
++}
++
++static const struct virtio_device_id id_table[] = {
++	{ VIRTIO_ID_RPC, VIRTIO_DEV_ANY_ID },
++	{ 0 },
++};
++
++static struct virtio_driver virtio_rpc_driver = {
++	.driver.name = KBUILD_MODNAME,
++	.driver.owner = THIS_MODULE,
++	.id_table = id_table,
++	.probe = virtio_rpc_probe,
++	.remove = virtio_rpc_remove,
++};
++
++static int __init virtio_rpc_init(void)
++{
++	dev_t dev;
++
++	int retval = class_register(&virtio_rpc_class);
++	if (retval) {
++		printk(KERN_ERR
++		       "virtio_rpc: can't register virtio_rpc class\n");
++		return retval;
++	}
++
++	retval = alloc_chrdev_region(&dev, 0, 8, "virtio_rpc");
++	if (retval) {
++		printk(KERN_ERR
++		       "virtio-rpc: can't register character device\n");
++		return retval;
++	}
++	virtio_rpc_major = MAJOR(dev);
++
++	printk(KERN_INFO "virtio_rpc: Loaded!\n");
++	return register_virtio_driver(&virtio_rpc_driver);
++}
++static void __exit virtio_rpc_exit(void)
++{
++	printk(KERN_INFO "virtio_rpc: Unloaded!\n");
++	unregister_virtio_driver(&virtio_rpc_driver);
++}
++
++module_init(virtio_rpc_init);
++module_exit(virtio_rpc_exit);
++
++MODULE_DEVICE_TABLE(virtio, id_table);
++MODULE_VERSION("0.01");
++MODULE_DESCRIPTION("Virtio RPC driver");
++MODULE_LICENSE("GPL");
+\ No newline at end of file
+diff --git a/include/uapi/linux/virtio_ids.h b/include/uapi/linux/virtio_ids.h
+index 7aa2eb766..c7f4f15ac 100644
+--- a/include/uapi/linux/virtio_ids.h
++++ b/include/uapi/linux/virtio_ids.h
+@@ -69,6 +69,8 @@
+ #define VIRTIO_ID_BT			40 /* virtio bluetooth */
+ #define VIRTIO_ID_GPIO			41 /* virtio gpio */
+ 
++#define VIRTIO_ID_RPC 88 /* virtio rpc */
++
+ /*
+  * Virtio Transitional IDs
+  */
+diff --git a/include/uapi/linux/virtio_rpc.h b/include/uapi/linux/virtio_rpc.h
+new file mode 100644
+index 000000000..73a29afe9
+--- /dev/null
++++ b/include/uapi/linux/virtio_rpc.h
+@@ -0,0 +1,14 @@
++#ifndef _LINUX_VIRTIO_RPC_H
++#define _LINUX_VIRTIO_RPC_H
++
++/* This header is BSD licensed so anyone can use the definitions to implement
++ * compatible drivers/servers. */
++#include <linux/types.h>
++#include <linux/virtio_ids.h>
++#include <linux/virtio_config.h>
++
++struct virtio_rpc_config {
++	uint64_t magic;
++};
++
++#endif /* _LINUX_VIRTIO_RPC_H */

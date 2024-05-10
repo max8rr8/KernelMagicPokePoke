@@ -1,0 +1,13 @@
+# Linux system images used inside qemu
+initramfs.img
+initramfs-linux.img
+rootfs.img
+
+# Upstream repos
+qemu
+qemu_install
+linux
+
+# 
+shared/main
+shared/a.out

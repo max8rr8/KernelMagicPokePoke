@@ -1,0 +1,233 @@
+diff --git a/hw/virtio/Kconfig b/hw/virtio/Kconfig
+index 92c9cf6..02cdcdf 100644
+--- a/hw/virtio/Kconfig
++++ b/hw/virtio/Kconfig
+@@ -105,3 +105,8 @@ config VHOST_USER_SCMI
+     bool
+     default y
+     depends on VIRTIO && VHOST_USER
++
++config VIRTIO_RPC
++    bool
++    default y
++    depends on VIRTIO
+diff --git a/hw/virtio/meson.build b/hw/virtio/meson.build
+index 13e7c6c..569474b 100644
+--- a/hw/virtio/meson.build
++++ b/hw/virtio/meson.build
+@@ -37,6 +37,7 @@ specific_virtio_ss.add(when: 'CONFIG_VHOST_USER_GPIO', if_true: files('vhost-use
+ specific_virtio_ss.add(when: ['CONFIG_VIRTIO_PCI', 'CONFIG_VHOST_USER_GPIO'], if_true: files('vhost-user-gpio-pci.c'))
+ specific_virtio_ss.add(when: 'CONFIG_VHOST_USER_SCMI', if_true: files('vhost-user-scmi.c'))
+ specific_virtio_ss.add(when: ['CONFIG_VIRTIO_PCI', 'CONFIG_VHOST_USER_SCMI'], if_true: files('vhost-user-scmi-pci.c'))
++specific_virtio_ss.add(when: 'CONFIG_VIRTIO_RPC', if_true: files('virtio-rpc.c'))
+ 
+ virtio_pci_ss = ss.source_set()
+ virtio_pci_ss.add(when: 'CONFIG_VHOST_VSOCK', if_true: files('vhost-vsock-pci.c'))
+diff --git a/hw/virtio/virtio-rpc.c b/hw/virtio/virtio-rpc.c
+new file mode 100644
+index 0000000..6e7b8fe
+--- /dev/null
++++ b/hw/virtio/virtio-rpc.c
+@@ -0,0 +1,118 @@
++#include "qemu/osdep.h"
++
++#include "qapi/error.h"
++#include "qemu/iov.h"
++#include "qemu/module.h"
++#include "qemu/qemu-print.h"
++#include "qemu/timer.h"
++
++#include "hw/virtio/virtio-access.h"
++#include "hw/virtio/virtio-rpc.h"
++#include "standard-headers/linux/virtio_rpc.h"
++#include <stdint.h>
++#include <stdio.h>
++
++typedef struct VirtIODeviceRequest {
++  VirtQueueElement elem;
++  VirtIORPC *rpc;
++  VirtIODevice *vdev;
++} VirtIODeviceRequest;
++
++static void RPC(void *inbuf, size_t insize, void *outbuf, size_t outsize) {
++  char *inp = inbuf;
++  inp[insize - 1] = 0;
++  qemu_printf("RPC: recieved %s\n", inp);
++
++  strcpy(outbuf, "Hi, Max!");
++  qemu_printf("RPC: responded %s\n", (char *)outbuf);
++}
++
++static void virtio_rpc_handle_vqreq(VirtIODevice *vdev, VirtQueue *vq) {
++  qemu_printf("virtio-rpc-device: Handle\n");
++  VirtIODeviceRequest *req_data;
++  unsigned int len = 0;
++
++  req_data = virtqueue_pop(vq, sizeof(VirtIODeviceRequest));
++  if (!req_data) {
++    return;
++  }
++
++  size_t insize = req_data->elem.out_sg->iov_len;
++  size_t outsize = req_data->elem.in_sg->iov_len;
++  void *inbuf = malloc(insize);
++  void *outbuf = malloc(outsize);
++
++  len += iov_to_buf(req_data->elem.out_sg, req_data->elem.out_num, 0, inbuf,
++                    insize);
++
++  RPC(inbuf, insize, outbuf, outsize);
++
++  len += iov_from_buf(req_data->elem.in_sg, req_data->elem.in_num, 0, outbuf,
++                      outsize);
++
++  virtqueue_push(vq, &req_data->elem, len);
++  virtio_notify(vdev, vq);
++}
++
++static void virtio_rpc_get_config(VirtIODevice *vdev, uint8_t *config) {
++  struct virtio_rpc_config *rpccfg = (struct virtio_rpc_config *)config;
++
++  virtio_stq_p(vdev, &rpccfg->magic, 0xDEADBEEF);
++}
++
++static uint64_t virtio_rpc_get_features(VirtIODevice *vdev, uint64_t features,
++                                        Error **errp) {
++  return features;
++}
++
++static Property virtio_rpc_properties[] = {
++    DEFINE_PROP_END_OF_LIST(),
++};
++
++static void virtio_rpc_realize(DeviceState *dev, Error **errp) {
++  VirtIODevice *vdev = VIRTIO_DEVICE(dev);
++  VirtIORPC *rpc = VIRTIO_RPC(dev);
++
++  virtio_init(vdev, VIRTIO_ID_RPC, sizeof(struct virtio_rpc_config));
++  rpc->vq = virtio_add_queue(vdev, 128, virtio_rpc_handle_vqreq);
++}
++
++static void virtio_rpc_unrealize(DeviceState *dev) {
++  VirtIODevice *vdev = VIRTIO_DEVICE(dev);
++  VirtIORPC *rpc = VIRTIO_RPC(dev);
++
++  virtio_delete_queue(rpc->vq);
++  virtio_cleanup(vdev);
++}
++
++static void virtio_rpc_class_init(ObjectClass *klass, void *data) {
++  DeviceClass *dc = DEVICE_CLASS(klass);
++  VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
++  // vpc = vpc;
++  qemu_printf("Hello from clas init %p", vdc);
++
++  device_class_set_props(dc, virtio_rpc_properties);
++
++  vdc->realize = virtio_rpc_realize;
++  vdc->unrealize = virtio_rpc_unrealize;
++  vdc->get_config = virtio_rpc_get_config;
++  vdc->get_features = virtio_rpc_get_features;
++
++  // vpc->fill_device_info = virtio_pmem_fill_device_info;
++  // vpc->get_memory_region = virtio_pmem_get_memory_region;
++  set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
++}
++
++static const TypeInfo virtio_rpc_info = {
++    .name = TYPE_VIRTIO_RPC,
++    .parent = TYPE_VIRTIO_DEVICE,
++    .class_size = sizeof(VirtioDeviceClass),
++    .class_init = virtio_rpc_class_init,
++    .instance_size = sizeof(VirtIORPC),
++};
++
++static void virtio_register_types(void) {
++  type_register_static(&virtio_rpc_info);
++}
++
++type_init(virtio_register_types)
+\ No newline at end of file
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index 969c25f..c37308e 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -194,7 +194,8 @@ const char *virtio_device_names[] = {
+     [VIRTIO_ID_PARAM_SERV] = "virtio-param-serv",
+     [VIRTIO_ID_AUDIO_POLICY] = "virtio-audio-pol",
+     [VIRTIO_ID_BT] = "virtio-bluetooth",
+-    [VIRTIO_ID_GPIO] = "virtio-gpio"
++    [VIRTIO_ID_GPIO] = "virtio-gpio",
++    [VIRTIO_ID_RPC] = "virtio-rpc"
+ };
+ 
+ static const char *virtio_id_to_name(uint16_t device_id)
+diff --git a/include/hw/virtio/virtio-rpc.h b/include/hw/virtio/virtio-rpc.h
+new file mode 100644
+index 0000000..6c38dfd
+--- /dev/null
++++ b/include/hw/virtio/virtio-rpc.h
+@@ -0,0 +1,31 @@
++/*
++ * Virtio PMEM device
++ *
++ * Copyright (C) 2018-2019 Red Hat, Inc.
++ *
++ * Authors:
++ *  Pankaj Gupta <pagupta@redhat.com>
++ *  David Hildenbrand <david@redhat.com>
++ *
++ * This work is licensed under the terms of the GNU GPL, version 2.
++ * See the COPYING file in the top-level directory.
++ */
++
++#ifndef HW_VIRTIO_RPC_H
++#define HW_VIRTIO_RPC_H
++
++#include "hw/virtio/virtio.h"
++#include "qapi/qapi-types-machine.h"
++#include "qom/object.h"
++
++#define TYPE_VIRTIO_RPC "virtio-rpc"
++
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIORPC, VIRTIO_RPC)
++
++struct VirtIORPC {
++    VirtIODevice parent_obj;
++
++    VirtQueue *vq;
++};
++
++#endif
+diff --git a/include/standard-headers/linux/virtio_ids.h b/include/standard-headers/linux/virtio_ids.h
+index 7aa2eb7..41c5857 100644
+--- a/include/standard-headers/linux/virtio_ids.h
++++ b/include/standard-headers/linux/virtio_ids.h
+@@ -69,6 +69,8 @@
+ #define VIRTIO_ID_BT			40 /* virtio bluetooth */
+ #define VIRTIO_ID_GPIO			41 /* virtio gpio */
+ 
++#define VIRTIO_ID_RPC			88 /* virtio rpc */
++
+ /*
+  * Virtio Transitional IDs
+  */
+diff --git a/include/standard-headers/linux/virtio_rpc.h b/include/standard-headers/linux/virtio_rpc.h
+new file mode 100644
+index 0000000..b09027f
+--- /dev/null
++++ b/include/standard-headers/linux/virtio_rpc.h
+@@ -0,0 +1,13 @@
++#ifndef _LINUX_VIRTIO_RPC_H
++#define _LINUX_VIRTIO_RPC_H
++/* This header is BSD licensed so anyone can use the definitions to implement
++ * compatible drivers/servers. */
++#include "standard-headers/linux/virtio_ids.h"
++#include "standard-headers/linux/virtio_config.h"
++
++struct virtio_rpc_config {
++	uint64_t magic;
++};
++
++
++#endif /* _LINUX_VIRTIO_RPC_H */
